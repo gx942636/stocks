@@ -23,6 +23,53 @@ def _normalize_code(code: str) -> str:
     return code.zfill(6)
 
 
+_EMPTY_DAILY_COLUMNS = [
+    "date",
+    "code",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "turnover",
+    "pct_chg",
+]
+
+
+def _sina_symbol(code: str) -> str:
+    """新浪日线代码：沪市 sh，深市 sz。"""
+    code = _normalize_code(code)
+    if code.startswith(("5", "6", "9")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
+def _empty_daily() -> pd.DataFrame:
+    return pd.DataFrame(columns=_EMPTY_DAILY_COLUMNS)
+
+
+def _frame_from_sina(code: str, raw: pd.DataFrame) -> pd.DataFrame:
+    """新浪日线映射到统一列。换手率由比例改为百分数，成交量改为「手」以便和东财缓存一致。"""
+    close = pd.to_numeric(raw["close"], errors="coerce")
+    volume = pd.to_numeric(raw["volume"], errors="coerce") / 100.0
+    turnover = pd.to_numeric(raw["turnover"], errors="coerce") * 100.0 if "turnover" in raw.columns else float("nan")
+    return pd.DataFrame(
+        {
+            "date": pd.to_datetime(raw["date"]),
+            "code": code,
+            "open": pd.to_numeric(raw["open"], errors="coerce"),
+            "high": pd.to_numeric(raw["high"], errors="coerce"),
+            "low": pd.to_numeric(raw["low"], errors="coerce"),
+            "close": close,
+            "volume": volume,
+            "amount": pd.to_numeric(raw["amount"], errors="coerce"),
+            "turnover": turnover,
+            "pct_chg": close.pct_change() * 100.0,
+        }
+    )
+
+
 def _to_yi(value: float) -> float:
     """流通/总市值统一为亿元。原始常为元。"""
     if pd.isna(value):
@@ -40,6 +87,10 @@ class AkshareProvider(DataProvider):
         self._pause = float(self.data_cfg.get("request_pause", 0.15))
         self._adjust = self.data_cfg.get("adjust", "qfq")
         self._vpn_split = bool(self.data_cfg.get("vpn_split_domestic", True))
+        self.daily_fetch_failures = 0
+        self._logged_sina_daily = False
+        self._logged_sina_fallback = False
+        self._logged_em_daily_error = False
 
     def _prepare_network(self) -> None:
         ensure_vpn_split(self._vpn_split)
@@ -140,20 +191,21 @@ class AkshareProvider(DataProvider):
                 self._spot["code"] = self._spot["code"].map(_normalize_code)
                 return self._spot
 
-        ak = self._import_ak()
+        self._prepare_network()
         last_exc: Exception | None = None
         try:
-            raw = ak.stock_zh_a_spot_em()
-            df = self._normalize_spot_em(raw)
-            print("行情来源: 东方财富 stock_zh_a_spot_em")
+            df = self._load_spot_from_sina()
+            print("行情来源: 新浪财经")
         except Exception as exc:
             last_exc = exc
-            print(f"东方财富行情失败，尝试新浪备用源: {type(exc).__name__}")
+            print(f"新浪列表失败，改走东方财富: {type(exc).__name__}")
             try:
-                df = self._load_spot_from_sina()
-                print("行情来源: 新浪财经备用 stock_zh_a_spot")
-            except Exception as sina_exc:
-                raise RuntimeError(format_vpn_fetch_error(sina_exc)) from sina_exc
+                ak = self._import_ak()
+                raw = ak.stock_zh_a_spot_em()
+                df = self._normalize_spot_em(raw)
+                print("行情来源: 东方财富备用 stock_zh_a_spot_em")
+            except Exception as em_exc:
+                raise RuntimeError(format_vpn_fetch_error(em_exc)) from em_exc
 
         if df is None or df.empty:
             raise RuntimeError(format_vpn_fetch_error(last_exc or RuntimeError("空行情")))
@@ -198,54 +250,98 @@ class AkshareProvider(DataProvider):
                 need_fetch = False
 
         if need_fetch:
-            ak = self._import_ak()
             time.sleep(self._pause)
-            try:
-                raw = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
-                    start_date=start,
-                    end_date=end,
-                    adjust=self._adjust,
-                )
-            except Exception as exc:
-                # 单票失败不中断全市场；若是代理类错误打印一次提示
-                msg = str(exc).lower()
-                if "proxy" in msg or "proxyerror" in type(exc).__name__.lower():
-                    print(format_vpn_fetch_error(exc))
-                return pd.DataFrame(columns=["date", "code", "open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"])
-
-            if raw is None or raw.empty:
-                return pd.DataFrame(columns=["date", "code", "open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"])
-
-            df = pd.DataFrame(
-                {
-                    "date": pd.to_datetime(raw["日期"]),
-                    "code": code,
-                    "open": pd.to_numeric(raw["开盘"], errors="coerce"),
-                    "high": pd.to_numeric(raw["最高"], errors="coerce"),
-                    "low": pd.to_numeric(raw["最低"], errors="coerce"),
-                    "close": pd.to_numeric(raw["收盘"], errors="coerce"),
-                    "volume": pd.to_numeric(raw["成交量"], errors="coerce"),
-                    "amount": pd.to_numeric(raw["成交额"], errors="coerce"),
-                    "turnover": pd.to_numeric(raw["换手率"], errors="coerce"),
-                    "pct_chg": pd.to_numeric(raw["涨跌幅"], errors="coerce"),
-                }
-            )
-            if cached is not None and not cached.empty:
-                df = (
-                    pd.concat([cached, df], ignore_index=True)
-                    .drop_duplicates(subset=["date"], keep="last")
-                    .sort_values("date")
-                )
-            df.to_csv(cache_path, index=False, encoding="utf-8-sig")
-            cached = df
+            df = self._pull_daily(code, start, end)
+            if df is None or df.empty:
+                if cached is None or cached.empty:
+                    self.daily_fetch_failures += 1
+                    return _empty_daily()
+            else:
+                if cached is not None and not cached.empty:
+                    df = (
+                        pd.concat([cached, df], ignore_index=True)
+                        .drop_duplicates(subset=["date"], keep="last")
+                        .sort_values("date")
+                    )
+                df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+                cached = df
 
         assert cached is not None
         mask = (cached["date"] >= pd.Timestamp(start_date)) & (cached["date"] <= pd.Timestamp(end_date))
         out = cached.loc[mask].copy()
         out["code"] = code
         return out.reset_index(drop=True)
+
+    def _pull_daily(self, code: str, start: str, end: str) -> pd.DataFrame | None:
+        """先新浪，这一只失败或为空时再试东财。"""
+        frame = self._fetch_sina_daily(code, start, end)
+        if frame is not None and not frame.empty:
+            return frame
+        if not self._logged_sina_fallback:
+            self._logged_sina_fallback = True
+            print("新浪日线失败，该股改走东方财富")
+        try:
+            frame = self._fetch_em_daily(code, start, end)
+        except Exception as exc:
+            self._note_em_daily_error(exc)
+            return None
+        return frame
+
+    def _note_em_daily_error(self, exc: Exception) -> None:
+        if self._logged_em_daily_error:
+            return
+        self._logged_em_daily_error = True
+        msg = str(exc).lower()
+        if "proxy" in msg or "proxyerror" in type(exc).__name__.lower():
+            print(format_vpn_fetch_error(exc))
+        else:
+            print(f"东方财富日线也失败: {type(exc).__name__}")
+
+    def _fetch_em_daily(self, code: str, start: str, end: str) -> pd.DataFrame | None:
+        ak = self._import_ak()
+        raw = ak.stock_zh_a_hist(
+            symbol=code,
+            period="daily",
+            start_date=start,
+            end_date=end,
+            adjust=self._adjust,
+        )
+        if raw is None or raw.empty:
+            return None
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(raw["日期"]),
+                "code": code,
+                "open": pd.to_numeric(raw["开盘"], errors="coerce"),
+                "high": pd.to_numeric(raw["最高"], errors="coerce"),
+                "low": pd.to_numeric(raw["最低"], errors="coerce"),
+                "close": pd.to_numeric(raw["收盘"], errors="coerce"),
+                "volume": pd.to_numeric(raw["成交量"], errors="coerce"),
+                "amount": pd.to_numeric(raw["成交额"], errors="coerce"),
+                "turnover": pd.to_numeric(raw["换手率"], errors="coerce"),
+                "pct_chg": pd.to_numeric(raw["涨跌幅"], errors="coerce"),
+            }
+        )
+
+    def _fetch_sina_daily(self, code: str, start: str, end: str) -> pd.DataFrame | None:
+        ak = self._import_ak()
+        adjust = self._adjust if self._adjust in ("qfq", "hfq", "") else "qfq"
+        try:
+            raw = ak.stock_zh_a_daily(
+                symbol=_sina_symbol(code),
+                start_date=start,
+                end_date=end,
+                adjust=adjust,
+            )
+            if raw is None or raw.empty or "close" not in getattr(raw, "columns", []):
+                return None
+            frame = _frame_from_sina(code, raw)
+        except Exception:
+            return None
+        if not self._logged_sina_daily:
+            self._logged_sina_daily = True
+            print("日线来源: 新浪财经 stock_zh_a_daily")
+        return frame
 
     def get_fundamentals(self, codes: list[str] | None = None) -> pd.DataFrame:
         spot = self._load_spot()
@@ -273,7 +369,7 @@ class AkshareProvider(DataProvider):
         return df.reset_index(drop=True)
 
     def _try_fill_growth(self, df: pd.DataFrame) -> pd.DataFrame:
-        """尽力从业绩报表补增速；失败不影响主流程。"""
+        """只用本地增速缓存。不主动请求东方财富。"""
         cache_path = self.cache_dir / "growth_yoy.csv"
         if cache_path.exists():
             try:
@@ -284,25 +380,4 @@ class AkshareProvider(DataProvider):
                 )
             except Exception:
                 pass
-        try:
-            ak = self._import_ak()
-            # 东方财富业绩报表（可能因接口变动失败）
-            raw = ak.stock_yjbb_em(date=pd.Timestamp.today().strftime("%Y%m%d"))
-            if raw is None or raw.empty:
-                return df
-            # 列名随版本变化，尽量兼容
-            code_col = "股票代码" if "股票代码" in raw.columns else raw.columns[0]
-            rev_col = next((c for c in raw.columns if "营业总收入同比" in str(c) or "营业收入同比" in str(c)), None)
-            profit_col = next((c for c in raw.columns if "净利润同比" in str(c)), None)
-            if rev_col is None and profit_col is None:
-                return df
-            growth = pd.DataFrame({"code": raw[code_col].map(_normalize_code)})
-            growth["revenue_yoy"] = pd.to_numeric(raw[rev_col], errors="coerce") if rev_col else float("nan")
-            growth["profit_yoy"] = pd.to_numeric(raw[profit_col], errors="coerce") if profit_col else float("nan")
-            growth = growth.drop_duplicates("code")
-            growth.to_csv(cache_path, index=False, encoding="utf-8-sig")
-            return df.drop(columns=["revenue_yoy", "profit_yoy"], errors="ignore").merge(
-                growth, on="code", how="left"
-            )
-        except Exception:
-            return df
+        return df

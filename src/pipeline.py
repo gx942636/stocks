@@ -1,6 +1,7 @@
 """取数 → 筛选 → 回测 → 导出。"""
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +21,24 @@ from src.strategy.reasons import build_reason
 from src.strategy.risk_reward import compute_risk_reward
 
 
+ProgressFn = Callable[[int, int, str], None]
+
+
 def _lookback_start(start_date: str, days: int = 120) -> str:
     dt = pd.Timestamp(start_date) - pd.Timedelta(days=days)
     return dt.strftime("%Y-%m-%d")
+
+
+def _iter_with_progress(items: list[Any], desc: str, progress: ProgressFn | None):
+    """未传 progress 时走 tqdm；传入时大约每 20 条回调一次，最后一条必回调。"""
+    total = len(items)
+    if progress is not None and total == 0:
+        progress(0, 0, desc)
+    iterable: Any = items if progress is not None else tqdm(items, total=total, desc=desc)
+    for i, item in enumerate(iterable, start=1):
+        yield item
+        if progress is not None and (i == total or i % 20 == 0):
+            progress(i, total, desc)
 
 
 def collect_stock_data(
@@ -31,6 +47,7 @@ def collect_stock_data(
     start_date: str,
     end_date: str,
     strategy: dict[str, Any],
+    progress: ProgressFn | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str], dict[str, float]]:
     """拉取并过滤股票池，返回 daily_map / name_map / circ_mv_map。"""
     fetch_start = _lookback_start(start_date, 150)
@@ -38,7 +55,8 @@ def collect_stock_data(
     name_map: dict[str, str] = {}
     circ_mv_map: dict[str, float] = {}
 
-    for _, row in tqdm(universe.iterrows(), total=len(universe), desc="拉取日线"):
+    rows = list(universe.iterrows())
+    for _, row in _iter_with_progress(rows, "拉取日线", progress):
         code = str(row["code"]).zfill(6)
         name = str(row.get("name", code))
         is_st = bool(row.get("is_st", False))
@@ -67,6 +85,7 @@ def generate_signals(
     end_date: str,
     strategy: dict[str, Any],
     fund_map: dict[str, dict[str, Any]] | None = None,
+    progress: ProgressFn | None = None,
 ) -> pd.DataFrame:
     """区间内逐日扫描信号，并计算盈亏比过滤。"""
     fund_map = fund_map or {}
@@ -75,7 +94,8 @@ def generate_signals(
     start_ts = pd.Timestamp(start_date)
     end_ts = pd.Timestamp(end_date)
 
-    for code, daily in tqdm(daily_map.items(), desc="扫描信号"):
+    items = list(daily_map.items())
+    for code, daily in _iter_with_progress(items, "扫描信号", progress):
         sub = daily[(daily["date"] >= start_ts) & (daily["date"] <= end_ts)]
         for _, bar in sub.iterrows():
             ok, metrics = evaluate_bar(bar, strategy, circ_mv_map.get(code))

@@ -50,13 +50,11 @@ def main() -> None:
             "网络分流: 已保留 VPN/系统代理；国内行情强制直连；"
             f"clist探测={'OK' if split_info.get('probe_ok') else '失败'}"
         )
+        print("  行情主源: 新浪，失败时再试东方财富。")
         if split_info.get("probe_detail"):
             print(f"  探测详情: {split_info.get('probe_detail')}")
         if split_info.get("probe_ok") is False:
-            print(
-                "  提示: 东财探测失败时将尝试新浪备用源；"
-                "TUN 模式请在客户端为 *.eastmoney.com / *.sina.com.cn 设 DIRECT。"
-            )
+            print("  提示: 东财探测失败，备用源可能不可用。")
     elif not split_enabled:
         print("网络分流: 已关闭（data.vpn_split_domestic=false）")
 

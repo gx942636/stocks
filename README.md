@@ -29,6 +29,8 @@ PyCharm：`File → Settings → Project → Python Interpreter` 安装 `require
 3. 右键运行 [`main.py`](main.py)
 4. 看终端摘要，详细结果在 `output/` 的 Excel
 
+网页回测：在项目根目录运行 `streamlit run app.py`，在浏览器里选日期和常用参数后点「开始回测」。结果只在页面上查看，不导出 Excel。页面上没有的策略阈值仍用 `config.yaml`。
+
 ## 输出说明
 
 Excel 一般包含：
@@ -76,6 +78,7 @@ daily/600000.csv        # date,open,high,low,close,volume,amount,turnover,pct_ch
 
 ```text
 main.py                 # PyCharm 入口
+app.py                  # 本地网页入口（streamlit run app.py）
 config.yaml             # 日期与策略参数
 src/data/               # 多渠道数据适配
 src/strategy/           # 过滤、盈亏比、推荐理由

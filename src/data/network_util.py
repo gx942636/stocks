@@ -33,6 +33,7 @@ DOMESTIC_DATA_HOSTS: tuple[str, ...] = (
 
 _APPLIED = False
 _PATCHED = False
+_QUOTE_SOURCE = "sina"
 _ORIG_SESSION_REQUEST = None
 _ORIG_REQUEST_WITH_RETRY = None
 
@@ -135,6 +136,9 @@ def apply_vpn_friendly_split(enabled: bool = True) -> dict[str, Any]:
     ok, detail = probe_eastmoney()
     result["probe_ok"] = ok
     result["probe_detail"] = detail
+    # 探测只提示东财是否可达，不改变主源。列表和日线始终先走新浪。
+    set_quote_source("sina")
+    result["quote_source"] = quote_source()
     return result
 
 
@@ -237,6 +241,20 @@ def install_akshare_direct_patch() -> bool:
 
     _PATCHED = True
     return True
+
+
+def quote_source() -> str:
+    """eastmoney 或 sina。探测失败后为 sina。"""
+    return _QUOTE_SOURCE
+
+
+def use_sina_quote_source() -> bool:
+    return _QUOTE_SOURCE == "sina"
+
+
+def set_quote_source(source: str) -> None:
+    global _QUOTE_SOURCE
+    _QUOTE_SOURCE = "sina" if source == "sina" else "eastmoney"
 
 
 def probe_eastmoney(timeout: float = 8.0) -> tuple[bool, str]:
