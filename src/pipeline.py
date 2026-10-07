@@ -50,7 +50,8 @@ def collect_stock_data(
     progress: ProgressFn | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str], dict[str, float]]:
     """拉取并过滤股票池，返回 daily_map / name_map / circ_mv_map。"""
-    fetch_start = _lookback_start(start_date, 150)
+    fetch_start = _lookback_start(start_date, int(strategy.get("history_calendar_days", 400)))
+    min_bars = int(strategy.get("lookback_days", 250))
     daily_map: dict[str, pd.DataFrame] = {}
     name_map: dict[str, str] = {}
     circ_mv_map: dict[str, float] = {}
@@ -66,7 +67,7 @@ def collect_stock_data(
             continue
 
         daily = provider.get_daily(code, fetch_start, end_date)
-        if daily is None or daily.empty or len(daily) < 70:
+        if daily is None or daily.empty or len(daily) < min_bars:
             continue
         daily = enrich_daily(daily, strategy)
         daily_map[code] = daily
@@ -87,25 +88,21 @@ def generate_signals(
     fund_map: dict[str, dict[str, Any]] | None = None,
     progress: ProgressFn | None = None,
 ) -> pd.DataFrame:
-    """区间内逐日扫描信号，并计算盈亏比过滤。"""
+    """区间内逐日扫描。盈亏比只留给回测参考，不作为入选条件。"""
     fund_map = fund_map or {}
-    min_rr = float(strategy.get("min_rr", 1.5))
     rows: list[dict[str, Any]] = []
     start_ts = pd.Timestamp(start_date)
     end_ts = pd.Timestamp(end_date)
 
     items = list(daily_map.items())
     for code, daily in _iter_with_progress(items, "扫描信号", progress):
+        fund = fund_map.get(code, {"name": name_map.get(code, code)})
         sub = daily[(daily["date"] >= start_ts) & (daily["date"] <= end_ts)]
         for _, bar in sub.iterrows():
-            ok, metrics = evaluate_bar(bar, strategy, circ_mv_map.get(code))
+            ok, metrics = evaluate_bar(bar, strategy, circ_mv_map.get(code), fund)
             if not ok:
                 continue
-            # 参考买入价用次日开盘更贴近实盘，信号阶段先用收盘测算 R
-            rr_info = compute_risk_reward(metrics["close"], metrics["high_60"], strategy)
-            if pd.isna(rr_info["rr"]) or rr_info["rr"] < min_rr:
-                continue
-            fund = fund_map.get(code, {"name": name_map.get(code, code)})
+            rr_info = compute_risk_reward(metrics["close"], metrics["high_lookback"], strategy)
             reason = build_reason(metrics, rr_info, fund)
             rows.append(
                 {
@@ -114,52 +111,49 @@ def generate_signals(
                     "name": name_map.get(code, code),
                     "signal_close": metrics["close"],
                     "pct_chg": metrics["pct_chg"],
-                    "turnover": metrics["turnover"],
-                    "volume_ratio": metrics["volume_ratio"],
-                    "ret_5d": metrics["ret_5d"],
-                    "ret_60d": metrics["ret_60d"],
-                    "drawdown_60d": metrics["drawdown_60d"],
-                    "high_60": metrics["high_60"],
+                    "drawdown_250": metrics["drawdown_250"],
+                    "range_pos": metrics["range_pos"],
+                    "amount_median": metrics["amount_median"],
+                    "high_lookback": metrics["high_lookback"],
+                    "low_lookback": metrics["low_lookback"],
                     "stop_price": rr_info["stop_price"],
                     "target_price": rr_info["target_price"],
                     "rr": rr_info["rr"],
                     "hold_days": rr_info["hold_days"],
-                    "pe_ttm": fund.get("pe_ttm"),
-                    "pb": fund.get("pb"),
-                    "circ_mv": fund.get("circ_mv", circ_mv_map.get(code)),
-                    "revenue_yoy": fund.get("revenue_yoy"),
-                    "profit_yoy": fund.get("profit_yoy"),
+                    "pe_ttm": metrics["pe_ttm"],
+                    "pb": metrics["pb"],
+                    "circ_mv": metrics["circ_mv"],
                     "reason": reason,
                 }
             )
 
     if not rows:
         return pd.DataFrame()
-    out = pd.DataFrame(rows).sort_values(["date", "rr"], ascending=[True, False])
+    out = pd.DataFrame(rows).sort_values(["date", "range_pos", "code"], ascending=[True, True, True])
     return out.reset_index(drop=True)
 
 
-def screen_on_date(signals: pd.DataFrame, asof: str | None = None) -> pd.DataFrame:
-    """取某一日（默认信号最后一天）的候选股，按盈亏比排序去重。"""
+def screen_period(signals: pd.DataFrame) -> pd.DataFrame:
+    """区间内按股票去重，保留最后一次符合的日期，并给出符合天数。"""
     if signals is None or signals.empty:
         return pd.DataFrame()
     sig = signals.copy()
     sig["date"] = pd.to_datetime(sig["date"])
-    if asof:
-        target = pd.Timestamp(asof)
-        day = sig[sig["date"] == target]
-        if day.empty:
-            # 取不超过 asof 的最近信号日
-            earlier = sig[sig["date"] <= target]
-            if earlier.empty:
-                return pd.DataFrame()
-            target = earlier["date"].max()
-            day = sig[sig["date"] == target]
-    else:
-        target = sig["date"].max()
-        day = sig[sig["date"] == target]
-    day = day.sort_values("rr", ascending=False).drop_duplicates("code")
-    return day.reset_index(drop=True)
+    counts = sig.groupby("code").size().rename("hit_days").reset_index()
+    latest = sig.loc[sig.groupby("code")["date"].idxmax()].copy()
+    latest = latest.merge(counts, on="code", how="left")
+    latest = latest.sort_values(["range_pos", "drawdown_250"], ascending=[True, False])
+    return latest.reset_index(drop=True)
+
+
+def first_signals(signals: pd.DataFrame) -> pd.DataFrame:
+    """每只股票只保留区间内第一次符合，避免回测里每天重复买入。"""
+    if signals is None or signals.empty:
+        return pd.DataFrame()
+    sig = signals.copy()
+    sig["date"] = pd.to_datetime(sig["date"])
+    sig = sig.sort_values(["date", "range_pos", "code"], ascending=[True, True, True])
+    return sig.drop_duplicates("code", keep="first").reset_index(drop=True)
 
 
 def build_fund_map(provider: DataProvider, codes: list[str]) -> dict[str, dict[str, Any]]:
@@ -232,20 +226,15 @@ def run_pipeline(config: dict[str, Any], project_root: Path, provider: DataProvi
     )
     print(f"区间信号条数: {0 if signals is None or signals.empty else len(signals)}")
 
-    candidates = screen_on_date(signals, asof=end_date)
-    print(f"期末候选股: {0 if candidates is None or candidates.empty else len(candidates)}")
+    candidates = screen_period(signals)
+    print(f"区间符合标的: {0 if candidates is None or candidates.empty else len(candidates)}")
 
     summary: dict[str, Any] = {}
     trades_df = pd.DataFrame()
     equity = pd.DataFrame()
 
     if mode in ("backtest", "both") and signals is not None and not signals.empty:
-        # 每天每只只保留最高 R，避免同日重复
-        bt_signals = (
-            signals.sort_values("rr", ascending=False)
-            .drop_duplicates(["date", "code"])
-            .reset_index(drop=True)
-        )
+        bt_signals = first_signals(signals)
         result = run_backtest(bt_signals, daily_map, strategy, backtest_cfg, name_map)
         summary = summarize_trades(result, float(backtest_cfg.get("initial_cash", 1_000_000)))
         trades_df = trades_to_frame(result.trades)

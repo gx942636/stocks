@@ -1,4 +1,4 @@
-# 中线埋伏回测 / 选股配置 —— 在 PyCharm 中改这里后运行 main.py
+# 中线低位筛选 / 回测配置 —— 在 PyCharm 中改这里后运行 main.py
 
 start_date: "2026-09-01"
 end_date: "2026-09-08"
@@ -9,47 +9,38 @@ data:
   cache_dir: data_cache
   tushare_token: ""        # source=tushare 时填写
   csv_dir: data_cache/csv  # source=csv 时读取目录
-  max_stocks: 800           # 首版限流（全市场很慢）；确认流程后再加大到 200~800
+  max_stocks: 800           # 流通市值达标后按成交额从高到低截取
   request_pause: 0.12      # 拉单票日线间隔（秒）
   adjust: qfq              # 前复权
   vpn_split_domestic: true # VPN 下保留代理，仅让东方财富等国内行情域名直连
 
 strategy:
-  # 硬过滤
-  price_min: 10
-  price_max: 50
-  circ_mv_min_yi: 50       # 流通市值（亿）
-  circ_mv_max_yi: 300
+  # 范围
+  price_min: 2             # 只排除低于 2 元的极低价
+  circ_mv_min_yi: 30       # 流通市值下限（亿），不设上限
   exclude_st: true
   exclude_kcb: true        # 科创板 688
   exclude_cyb: true        # 创业板 300 / 301
 
-  # 埋伏位
-  pct_chg_min: -5.0
-  pct_chg_max: 1.0
-  turnover_min: 1.0
-  turnover_max: 4.5
-  volume_ratio_min: 0.5
-  volume_ratio_max: 1.1
-  no_limit_up_days: 20
-  consecutive_up_max: 0
-  ret_60d_min: -28.0
-  ret_60d_max: -5.0
-  drawdown_60d_min: 12.0
-  drawdown_60d_max: 32.0
-  ret_5d_min: -10.0
-  ret_5d_max: 2.0
-  daily_drop_floor: -7.0   # 单日跌幅不低于 -7%
+  # 基本面没有坏（当前截面，不是历史估值）
+  pe_max: 150
+  pb_max: 15
 
-  # 盈亏比与持有
+  # 相对低位与以前的成交关注度
+  history_calendar_days: 400
+  lookback_days: 250       # 近一年交易日
+  drawdown_min: 30         # 自高点回撤至少（%）
+  range_pos_max: 0.35      # 收盘在高低区间从低点算起的比例上限
+  amount_window: 120
+  amount_median_min_yi: 0.5  # 近 120 日成交额中位数至少（亿）
+
+  # 回测持有（不作为入选条件）
   stop_loss_pct: 0.12
   take_profit_cap_pct: 0.25
-  repair_ratio: 0.60       # 目标价 = 现价 + (60日高 - 现价) * repair_ratio
-  min_rr: 1.5
+  repair_ratio: 0.60
   hold_min_days: 20
   hold_max_days: 40
   max_positions: 5
-  limit_up_threshold: 9.5  # 主板涨停近似阈值（%）
 
 backtest:
   initial_cash: 1000000

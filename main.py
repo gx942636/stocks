@@ -70,20 +70,21 @@ def main() -> None:
                 "code",
                 "name",
                 "signal_close",
-                "drawdown_60d",
-                "rr",
-                "stop_price",
-                "target_price",
+                "drawdown_250",
+                "range_pos",
+                "amount_median",
                 "pe_ttm",
                 "pb",
+                "circ_mv",
+                "hit_days",
                 "reason",
             ]
             if c in candidates.columns
         ]
-        print("\n期末候选股（前 20）：")
+        print("\n区间符合标的（前 20）：")
         print(candidates[cols].head(20).to_string(index=False))
     else:
-        print("\n期末无候选股。可放宽 config.yaml 中 strategy 阈值，或扩大 data.max_stocks。")
+        print("\n区间内没有符合的股票。可放宽 config.yaml 中的回撤、低位位置或日均成交额。")
 
     print(f"\n完成。Excel: {result.get('output')}")
 

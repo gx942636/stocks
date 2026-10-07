@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import html
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -23,12 +24,14 @@ from main import load_config
 from src.backtest.engine import run_backtest
 from src.backtest.metrics import summarize_trades, trades_to_frame
 from src.data.base import get_provider
+from src.data.concepts import fetch_stock_profile
 from src.data.network_util import apply_vpn_friendly_split, install_akshare_direct_patch, use_sina_quote_source
 from src.pipeline import (
     build_fund_map,
     collect_stock_data,
+    first_signals,
     generate_signals,
-    screen_on_date,
+    screen_period,
 )
 
 MODE_LABELS = {
@@ -42,17 +45,14 @@ CANDIDATE_LABELS = [
     ("date", "日期"),
     ("code", "代码"),
     ("name", "名称"),
-    ("signal_close", "信号收盘"),
-    ("pct_chg", "涨跌幅"),
-    ("turnover", "换手率"),
-    ("drawdown_60d", "60日回撤"),
-    ("ret_60d", "60日涨跌"),
-    ("rr", "盈亏比"),
-    ("stop_price", "止损价"),
-    ("target_price", "目标价"),
+    ("signal_close", "收盘价"),
+    ("drawdown_250", "一年回撤(%)"),
+    ("range_pos_pct", "区间位置(%)"),
+    ("amount_yi", "日均成交额(亿)"),
     ("pe_ttm", "PE"),
     ("pb", "PB"),
-    ("reason", "推荐理由"),
+    ("circ_mv", "流通市值(亿)"),
+    ("industry", "行业"),
 ]
 TRADE_LABELS = [
     ("code", "代码"),
@@ -115,10 +115,6 @@ def validate_form(form: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if form["start_date"] >= form["end_date"]:
         errors.append("开始日期必须早于结束日期。")
-    if form["price_min"] >= form["price_max"]:
-        errors.append("价格下限必须小于价格上限。")
-    if form["circ_mv_min"] >= form["circ_mv_max"]:
-        errors.append("流通市值下限必须小于上限。")
     if form["hold_min_days"] > form["hold_max_days"]:
         errors.append("最短持有天数不能大于最长持有天数。")
     if form["initial_cash"] <= 0:
@@ -127,8 +123,14 @@ def validate_form(form: dict[str, Any]) -> list[str]:
         errors.append("最大持仓和股票数上限必须为正数。")
     if form["hold_min_days"] <= 0 or form["hold_max_days"] <= 0:
         errors.append("持有天数必须为正数。")
-    if form["stop_loss_pct"] <= 0 or form["take_profit_pct"] <= 0 or form["min_rr"] <= 0:
-        errors.append("止损、止盈上限和最小盈亏比必须为正数。")
+    if form["stop_loss_pct"] <= 0 or form["take_profit_pct"] <= 0:
+        errors.append("止损和止盈上限必须为正数。")
+    if form["drawdown_min"] < 0:
+        errors.append("回撤至少不能为负数。")
+    if not 0 <= form["range_pos_pct"] <= 100:
+        errors.append("低位位置上限应在 0 到 100 之间。")
+    if form["amount_min_yi"] < 0:
+        errors.append("日均成交额下限不能为负数。")
     return errors
 
 
@@ -142,16 +144,14 @@ def apply_form(base: dict[str, Any], form: dict[str, Any]) -> dict[str, Any]:
     cfg.setdefault("backtest", {})
     cfg["data"]["max_stocks"] = int(form["max_stocks"])
     strategy = cfg["strategy"]
-    strategy["price_min"] = float(form["price_min"])
-    strategy["price_max"] = float(form["price_max"])
-    strategy["circ_mv_min_yi"] = float(form["circ_mv_min"])
-    strategy["circ_mv_max_yi"] = float(form["circ_mv_max"])
     strategy["max_positions"] = int(form["max_positions"])
     strategy["hold_min_days"] = int(form["hold_min_days"])
     strategy["hold_max_days"] = int(form["hold_max_days"])
     strategy["stop_loss_pct"] = float(form["stop_loss_pct"]) / 100.0
     strategy["take_profit_cap_pct"] = float(form["take_profit_pct"]) / 100.0
-    strategy["min_rr"] = float(form["min_rr"])
+    strategy["drawdown_min"] = float(form["drawdown_min"])
+    strategy["range_pos_max"] = float(form["range_pos_pct"]) / 100.0
+    strategy["amount_median_min_yi"] = float(form["amount_min_yi"])
     cfg["backtest"]["initial_cash"] = float(form["initial_cash"])
     return cfg
 
@@ -215,17 +215,13 @@ def run_backtest_job(config: dict[str, Any], on_progress) -> dict[str, Any]:
         fund_map,
         progress=on_progress,
     )
-    candidates = screen_on_date(signals, asof=end_date)
+    candidates = screen_period(signals)
     summary: dict[str, Any] = {}
     trades = pd.DataFrame()
     equity = pd.DataFrame()
     ran_backtest = False
     if mode in ("backtest", "both") and signals is not None and not signals.empty:
-        bt_signals = (
-            signals.sort_values("rr", ascending=False)
-            .drop_duplicates(["date", "code"])
-            .reset_index(drop=True)
-        )
+        bt_signals = first_signals(signals)
         result = run_backtest(bt_signals, daily_map, strategy, backtest_cfg, name_map)
         summary = summarize_trades(result, float(backtest_cfg.get("initial_cash", 1_000_000)))
         trades = trades_to_frame(result.trades)
@@ -241,11 +237,34 @@ def run_backtest_job(config: dict[str, Any], on_progress) -> dict[str, Any]:
         "n_signals": n_signals,
         "daily_fetch_failures": fetch_failures,
         "candidates": candidates,
+        "klines": _candidate_klines(daily_map, candidates),
+        "cache_dir": str(PROJECT_ROOT / str(data_cfg.get("cache_dir", "data_cache"))),
         "summary": summary,
         "trades": trades,
         "equity": equity,
         "ran_backtest": ran_backtest,
     }
+
+
+def _candidate_klines(
+    daily_map: dict[str, pd.DataFrame],
+    candidates: pd.DataFrame,
+    bars: int = 120,
+) -> dict[str, pd.DataFrame]:
+    """每只入选股保留最近一段日线，供 K 线使用，不再额外请求行情。"""
+    out: dict[str, pd.DataFrame] = {}
+    if candidates is None or candidates.empty:
+        return out
+    keep = ["date", "open", "high", "low", "close", "volume"]
+    for code in candidates["code"].astype(str):
+        code = code.zfill(6)
+        daily = daily_map.get(code)
+        if daily is None or daily.empty:
+            continue
+        tail = daily.sort_values("date").tail(bars)
+        cols = [col for col in keep if col in tail.columns]
+        out[code] = tail[cols].copy()
+    return out
 
 
 def _labeled_frame(df: pd.DataFrame, labels: list[tuple[str, str]]) -> pd.DataFrame:
@@ -342,6 +361,17 @@ section[data-testid="stSidebar"] {border-right: 1px solid #2b3139;}
 }
 .empty-board p {color: #c9d1d9; margin: 10px 0 0;}
 [data-testid="stDataFrame"] {border: 1px solid #2b3139; border-radius: 8px;}
+.tag-row {display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 12px;}
+.tag {
+  border: 1px solid #2b3139;
+  background: #1c2127;
+  color: #eaecef;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+.tag.industry {border-color: #f0b90b; color: #f0b90b;}
+.tag.missing {color: #8b949e;}
 @media (max-width: 900px) {
   .metric-grid {grid-template-columns: repeat(2, minmax(0, 1fr));}
   .term-head {flex-direction: column; align-items: flex-start;}
@@ -385,7 +415,7 @@ def _render_header(start_date: date, end_date: date, mode_label: str) -> None:
         <div class="term-head">
           <div>
             <div class="term-kicker">A-SHARE RESEARCH</div>
-            <div class="term-title">中线埋伏 <span>回测终端</span></div>
+            <div class="term-title">中线低位 <span>筛选</span></div>
           </div>
           <div class="term-pills">
             <span class="pill">{start_date:%Y-%m-%d} → {end_date:%Y-%m-%d}</span>
@@ -402,7 +432,7 @@ def _render_empty() -> None:
         """
         <div class="empty-board">
           <div class="empty-title">等待指令</div>
-          <p>在左侧设定区间与风控，然后开始回测。结果只在本页查看，其余策略阈值仍使用 config.yaml。</p>
+          <p>在左侧设定区间和低位条件，然后开始筛选。结果只在本页查看，市值下限和估值上限仍使用 config.yaml。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -433,6 +463,188 @@ def _render_equity(equity: pd.DataFrame) -> None:
         .configure_axis(labelColor="#8b949e", gridColor="#2b3139", domainColor="#2b3139")
     )
     st.altair_chart(chart, use_container_width=True, theme=None)
+
+
+def _fmt_num(value: Any, digits: int = 1, suffix: str = "") -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if number != number:
+        return "—"
+    return f"{number:.{digits}f}{suffix}"
+
+
+def _candidate_view(candidates: pd.DataFrame, profiles: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    view = candidates.copy()
+    view["code"] = view["code"].astype(str).str.zfill(6)
+    view["range_pos_pct"] = pd.to_numeric(view.get("range_pos"), errors="coerce") * 100
+    view["amount_yi"] = pd.to_numeric(view.get("amount_median"), errors="coerce") / 1e8
+    view["industry"] = view["code"].map(
+        lambda code: (profiles.get(code) or {}).get("industry") or "—"
+    )
+    for col, digits in (
+        ("signal_close", 2),
+        ("drawdown_250", 1),
+        ("range_pos_pct", 1),
+        ("amount_yi", 2),
+        ("pe_ttm", 1),
+        ("pb", 2),
+        ("circ_mv", 1),
+    ):
+        if col in view.columns:
+            view[col] = pd.to_numeric(view[col], errors="coerce").round(digits)
+    return view
+
+
+def _load_profiles(codes: list[str], cache_dir: Path) -> dict[str, dict[str, Any]]:
+    profiles: dict[str, dict[str, Any]] = {}
+    total = len(codes)
+    if total == 0:
+        return profiles
+    status = st.empty()
+    for index, code in enumerate(codes, start=1):
+        status.caption(f"读取题材：{index} / {total}")
+        cached = (cache_dir / "concepts" / f"{code}.json").exists()
+        profiles[code] = fetch_stock_profile(code, cache_dir, pause=0.0 if cached else 0.08)
+    status.empty()
+    return profiles
+
+
+def _theme_html(profile: dict[str, Any]) -> str:
+    if not profile or not profile.get("ok"):
+        return '<div class="tag-row"><span class="tag missing">题材暂缺</span></div>'
+    tags = []
+    industry = str(profile.get("industry") or "").strip()
+    if industry:
+        tags.append(f'<span class="tag industry">{html.escape(industry)}</span>')
+    themes = profile.get("themes") or []
+    if not themes and not industry:
+        tags.append('<span class="tag missing">暂无公开题材</span>')
+    for name in themes:
+        tags.append(f'<span class="tag">{html.escape(str(name))}</span>')
+    return f'<div class="tag-row">{"".join(tags)}</div>'
+
+
+def _render_kline(daily: pd.DataFrame, mark_date: Any) -> None:
+    chart_df = daily.copy()
+    chart_df["date"] = pd.to_datetime(chart_df["date"])
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in chart_df.columns:
+            chart_df[col] = pd.to_numeric(chart_df[col], errors="coerce")
+    chart_df = chart_df.dropna(subset=["date", "open", "high", "low", "close"])
+    if chart_df.empty:
+        st.caption("没有足够的日线画出 K 线。")
+        return
+    chart_df["实体收盘"] = chart_df["close"]
+    flat = chart_df["实体收盘"] == chart_df["open"]
+    chart_df.loc[flat, "实体收盘"] = chart_df.loc[flat, "open"] * 1.0008
+    chart_df["方向"] = (chart_df["close"] >= chart_df["open"]).map({True: "上涨", False: "下跌"})
+    color_scale = alt.Scale(domain=["上涨", "下跌"], range=["#f6465d", "#0ecb81"])
+    x = alt.X("date:T", title=None, axis=alt.Axis(format="%m-%d", labelAngle=-40, grid=False))
+    price_tip = [
+        alt.Tooltip("date:T", title="日期", format="%Y-%m-%d"),
+        alt.Tooltip("open:Q", title="开盘", format=".2f"),
+        alt.Tooltip("high:Q", title="最高", format=".2f"),
+        alt.Tooltip("low:Q", title="最低", format=".2f"),
+        alt.Tooltip("close:Q", title="收盘", format=".2f"),
+    ]
+    wick = (
+        alt.Chart(chart_df)
+        .mark_rule()
+        .encode(
+            x=x,
+            y=alt.Y("low:Q", title=None, scale=alt.Scale(zero=False)),
+            y2="high:Q",
+            color=alt.Color("方向:N", scale=color_scale, legend=None),
+            tooltip=price_tip,
+        )
+    )
+    body = (
+        alt.Chart(chart_df)
+        .mark_bar(size=5)
+        .encode(
+            x=x,
+            y="open:Q",
+            y2="实体收盘:Q",
+            color=alt.Color("方向:N", scale=color_scale, legend=None),
+            tooltip=price_tip,
+        )
+    )
+    price = wick + body
+    mark = pd.to_datetime(mark_date, errors="coerce")
+    if pd.notna(mark):
+        rule = (
+            alt.Chart(pd.DataFrame({"date": [mark]}))
+            .mark_rule(color="#f0b90b", strokeDash=[4, 3], strokeWidth=1.4)
+            .encode(x="date:T")
+        )
+        price = price + rule
+    volume = (
+        alt.Chart(chart_df)
+        .mark_bar(size=5)
+        .encode(
+            x=x,
+            y=alt.Y("volume:Q", title=None),
+            color=alt.Color("方向:N", scale=color_scale, legend=None),
+            tooltip=[
+                alt.Tooltip("date:T", title="日期", format="%Y-%m-%d"),
+                alt.Tooltip("volume:Q", title="成交量", format=",.0f"),
+            ],
+        )
+    )
+    chart = (
+        alt.vconcat(price.properties(height=280), volume.properties(height=80))
+        .resolve_scale(x="shared", color="independent")
+        .configure_view(strokeWidth=0)
+        .configure(background="transparent")
+        .configure_axis(labelColor="#8b949e", gridColor="#2b3139", domainColor="#2b3139")
+    )
+    st.altair_chart(chart, use_container_width=True, theme=None)
+
+
+def _render_stock_cards(
+    candidates: pd.DataFrame,
+    profiles: dict[str, dict[str, Any]],
+    klines: dict[str, pd.DataFrame],
+) -> None:
+    _section("个股详情")
+    st.caption("默认收起。黄色竖线是这只股票在筛选区间里最后一次符合的交易日。")
+    for _, row in candidates.iterrows():
+        code = str(row["code"]).zfill(6)
+        name = str(row.get("name") or code)
+        profile = profiles.get(code) or {}
+        title = f"{code}  {name}    {_fmt_num(row.get('signal_close'), 2)} 元"
+        with st.expander(title):
+            pos = row.get("range_pos")
+            try:
+                pos_pct = float(pos) * 100
+            except (TypeError, ValueError):
+                pos_pct = float("nan")
+            amount = row.get("amount_median")
+            try:
+                amount_yi = float(amount) / 1e8
+            except (TypeError, ValueError):
+                amount_yi = float("nan")
+            cards = "".join(
+                [
+                    _metric_card("现价", _fmt_num(row.get("signal_close"), 2), "flat"),
+                    _metric_card("一年回撤", _fmt_num(row.get("drawdown_250"), 1, "%"), "down"),
+                    _metric_card("区间位置", _fmt_num(pos_pct, 1, "%"), "flat"),
+                    _metric_card("PE", _fmt_num(row.get("pe_ttm"), 1), "flat"),
+                    _metric_card("PB", _fmt_num(row.get("pb"), 2), "flat"),
+                    _metric_card("流通市值", _fmt_num(row.get("circ_mv"), 1, "亿"), "flat"),
+                    _metric_card("120日成交额", _fmt_num(amount_yi, 2, "亿"), "flat"),
+                    _metric_card("符合天数", _fmt_num(row.get("hit_days"), 0, "天"), "flat"),
+                ]
+            )
+            st.markdown(f'<div class="metric-grid">{cards}</div>', unsafe_allow_html=True)
+            st.markdown(_theme_html(profile), unsafe_allow_html=True)
+            daily = klines.get(code)
+            if daily is None or daily.empty:
+                st.caption("没有足够的日线画出 K 线。")
+            else:
+                _render_kline(daily, row.get("date"))
 
 
 def render_result(result: dict[str, Any]) -> None:
@@ -480,16 +692,21 @@ def render_result(result: dict[str, Any]) -> None:
                 st.dataframe(_labeled_frame(trades, TRADE_LABELS), hide_index=True, use_container_width=True)
 
     if show_candidates:
-        _section("期末候选股")
+        _section("区间符合标的")
         candidates = result.get("candidates")
         if candidates is None or candidates.empty:
-            st.info("期末无候选股。可放宽阈值，或增大股票数上限。")
+            st.info("区间内没有符合的股票。可放宽回撤、低位位置或日均成交额，或增大股票数上限。")
         else:
-            st.dataframe(_labeled_frame(candidates, CANDIDATE_LABELS), hide_index=True, use_container_width=True)
+            codes = [str(code).zfill(6) for code in candidates["code"].tolist()]
+            profiles = _load_profiles(codes, Path(str(result.get("cache_dir") or PROJECT_ROOT / "data_cache")))
+            view = _candidate_view(candidates, profiles)
+            st.caption("区间位置越低，越贴近这一年的低点。行业来自入选后补拉的题材数据。")
+            st.dataframe(_labeled_frame(view, CANDIDATE_LABELS), hide_index=True, use_container_width=True)
+            _render_stock_cards(view, profiles, result.get("klines") or {})
 
 
 def main() -> None:
-    st.set_page_config(page_title="中线埋伏回测", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="中线低位筛选", layout="wide", initial_sidebar_state="expanded")
     _inject_css()
 
     config_path = PROJECT_ROOT / "config.yaml"
@@ -506,7 +723,7 @@ def main() -> None:
 
     with st.sidebar:
         st.markdown('<div class="side-label">控制台</div>', unsafe_allow_html=True)
-        st.caption("其余策略阈值仍使用 config.yaml。")
+        st.caption("市值下限、估值上限仍使用 config.yaml。")
 
     with st.sidebar.form("backtest_form"):
         _side_label("区间")
@@ -537,7 +754,7 @@ def main() -> None:
             min_value=1,
             value=int(strategy.get("hold_min_days", 20)),
             step=1,
-            help="用于推荐理由中的预计持有天数，不决定卖出时点。",
+            help="只用于回测里的持有区间，不决定能不能入选。",
         )
         hold_max_days = hold_c2.number_input(
             "最长持有天数",
@@ -563,12 +780,6 @@ def main() -> None:
             step=0.5,
             help="填写 25 表示目标涨幅不超过 25%。",
         )
-        min_rr = st.number_input(
-            "最小盈亏比",
-            min_value=0.1,
-            value=round(float(strategy.get("min_rr", 1.5)), 2),
-            step=0.1,
-        )
         max_stocks = st.number_input(
             "股票数上限",
             min_value=1,
@@ -577,24 +788,30 @@ def main() -> None:
             help="全市场扫描很慢，可先用较小数量。",
         )
 
-        _side_label("价格与市值")
-        price_c1, price_c2 = st.columns(2)
-        price_min = price_c1.number_input("价格下限", min_value=0.0, value=float(strategy.get("price_min", 10)), step=1.0)
-        price_max = price_c2.number_input("价格上限", min_value=0.0, value=float(strategy.get("price_max", 50)), step=1.0)
-        mv_c1, mv_c2 = st.columns(2)
-        circ_mv_min = mv_c1.number_input(
-            "流通市值下限（亿）",
+        _side_label("低位条件")
+        drawdown_min = st.number_input(
+            "回撤至少（%）",
             min_value=0.0,
-            value=float(strategy.get("circ_mv_min_yi", 50)),
-            step=10.0,
+            value=float(strategy.get("drawdown_min", 30)),
+            step=1.0,
+            help="相对近一年最高价，至少跌这么多才算处在低位。",
         )
-        circ_mv_max = mv_c2.number_input(
-            "流通市值上限（亿）",
+        range_pos_pct = st.number_input(
+            "低位位置上限（%）",
             min_value=0.0,
-            value=float(strategy.get("circ_mv_max_yi", 300)),
-            step=10.0,
+            max_value=100.0,
+            value=round(float(strategy.get("range_pos_max", 0.35)) * 100, 1),
+            step=1.0,
+            help="35 表示收盘要落在近一年高低区间里、从低点算起的 35% 以内。",
         )
-        submitted = st.form_submit_button("开始回测", type="primary", use_container_width=True)
+        amount_min_yi = st.number_input(
+            "日均成交额下限（亿）",
+            min_value=0.0,
+            value=float(strategy.get("amount_median_min_yi", 0.5)),
+            step=0.1,
+            help="近 120 个交易日成交额中位数，用来表示以前有没有人交易。",
+        )
+        submitted = st.form_submit_button("开始筛选", type="primary", use_container_width=True)
 
     _render_header(start_date, end_date, mode_label)
     note = st.session_state.get("network_note") or ""
@@ -615,12 +832,10 @@ def main() -> None:
             "hold_max_days": hold_max_days,
             "stop_loss_pct": stop_loss_pct,
             "take_profit_pct": take_profit_pct,
-            "min_rr": min_rr,
             "max_stocks": max_stocks,
-            "price_min": price_min,
-            "price_max": price_max,
-            "circ_mv_min": circ_mv_min,
-            "circ_mv_max": circ_mv_max,
+            "drawdown_min": drawdown_min,
+            "range_pos_pct": range_pos_pct,
+            "amount_min_yi": amount_min_yi,
         }
         errors = validate_form(form)
         if errors:
@@ -648,9 +863,9 @@ def main() -> None:
                 if int(done.get("n_daily") or 0) == 0 and int(done.get("daily_fetch_failures") or 0) > 0:
                     status.error("行情接口失败：新浪和东方财富日线都未取到数据。")
                 else:
-                    status.success("回测完成。")
+                    status.success("筛选完成。")
             except Exception as exc:
-                status.error(f"回测失败：{exc}")
+                status.error(f"筛选失败：{exc}")
 
     result = st.session_state.get("result")
     if result:

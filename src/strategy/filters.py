@@ -1,4 +1,4 @@
-"""中线埋伏技术过滤。"""
+"""中线低位筛选。"""
 from __future__ import annotations
 
 from typing import Any
@@ -27,41 +27,44 @@ def pass_name_filters(name: str, is_st: bool, strategy: dict[str, Any]) -> bool:
     return True
 
 
-def _limit_up_flag(pct_chg: float, threshold: float) -> bool:
-    return (not np.isnan(pct_chg)) and pct_chg >= threshold
+def _num(value: Any) -> float:
+    try:
+        if value is None or value == "":
+            return float("nan")
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return out
 
 
 def enrich_daily(df: pd.DataFrame, strategy: dict[str, Any]) -> pd.DataFrame:
-    """为日线增加策略所需衍生列。"""
+    """为日线增加一年高低点、区间位置和成交额中位数。"""
     if df is None or df.empty:
         return df
     out = df.sort_values("date").copy()
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out["high"] = pd.to_numeric(out["high"], errors="coerce")
+    out["low"] = pd.to_numeric(out["low"], errors="coerce")
+    if "pct_chg" not in out.columns:
+        out["pct_chg"] = np.nan
     out["pct_chg"] = pd.to_numeric(out["pct_chg"], errors="coerce")
     if out["pct_chg"].isna().all():
         out["pct_chg"] = out["close"].pct_change() * 100
 
-    # 量比近似：当日量 / 过去5日均量
-    vol_ma5 = out["volume"].rolling(5, min_periods=5).mean().shift(1)
-    out["volume_ratio"] = out["volume"] / vol_ma5.replace(0, np.nan)
+    lookback = int(strategy.get("lookback_days", 250))
+    amount_window = int(strategy.get("amount_window", 120))
+    high_n = out["high"].rolling(lookback, min_periods=lookback).max()
+    low_n = out["low"].rolling(lookback, min_periods=lookback).min()
+    span = (high_n - low_n).replace(0, np.nan)
+    out["high_lookback"] = high_n
+    out["low_lookback"] = low_n
+    out["drawdown_250"] = (high_n - out["close"]) / high_n.replace(0, np.nan) * 100
+    out["range_pos"] = (out["close"] - low_n) / span
 
-    out["ret_5d"] = out["close"].pct_change(5) * 100
-    out["ret_60d"] = out["close"].pct_change(60) * 100
-    high_60 = out["high"].rolling(60, min_periods=60).max()
-    out["high_60"] = high_60
-    out["drawdown_60d"] = (high_60 - out["close"]) / high_60.replace(0, np.nan) * 100
-
-    thr = float(strategy.get("limit_up_threshold", 9.5))
-    out["is_limit_up"] = out["pct_chg"].map(lambda x: _limit_up_flag(float(x) if pd.notna(x) else np.nan, thr))
-    out["had_limit_up_20"] = out["is_limit_up"].rolling(20, min_periods=1).max().astype(bool)
-
-    # 连涨天数（含当日）
-    up = (out["pct_chg"] > 0).astype(int)
-    streak = []
-    cur = 0
-    for v in up.tolist():
-        cur = cur + 1 if v == 1 else 0
-        streak.append(cur)
-    out["consecutive_up"] = streak
+    amount = pd.to_numeric(out["amount"], errors="coerce") if "amount" in out.columns else np.nan
+    out["amount_median"] = pd.Series(amount, index=out.index).rolling(
+        amount_window, min_periods=amount_window
+    ).median()
     return out
 
 
@@ -69,56 +72,51 @@ def evaluate_bar(
     row: pd.Series,
     strategy: dict[str, Any],
     circ_mv: float | None = None,
+    fund: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, float]]:
-    """判断单日是否满足埋伏条件。返回 (是否通过, 指标字典)。"""
+    """判断单日是否满足低位潜伏。返回 (是否通过, 指标字典)。"""
+    fund = fund or {}
+    mv = _num(circ_mv)
+    if np.isnan(mv):
+        mv = _num(fund.get("circ_mv"))
     metrics = {
-        "pct_chg": float(row.get("pct_chg", np.nan)),
-        "turnover": float(row.get("turnover", np.nan)),
-        "volume_ratio": float(row.get("volume_ratio", np.nan)),
-        "ret_5d": float(row.get("ret_5d", np.nan)),
-        "ret_60d": float(row.get("ret_60d", np.nan)),
-        "drawdown_60d": float(row.get("drawdown_60d", np.nan)),
-        "consecutive_up": float(row.get("consecutive_up", np.nan)),
-        "close": float(row.get("close", np.nan)),
-        "high_60": float(row.get("high_60", np.nan)),
+        "close": _num(row.get("close")),
+        "pct_chg": _num(row.get("pct_chg")),
+        "drawdown_250": _num(row.get("drawdown_250")),
+        "range_pos": _num(row.get("range_pos")),
+        "amount_median": _num(row.get("amount_median")),
+        "high_lookback": _num(row.get("high_lookback")),
+        "low_lookback": _num(row.get("low_lookback")),
+        "pe_ttm": _num(fund.get("pe_ttm")),
+        "pb": _num(fund.get("pb")),
+        "circ_mv": mv,
     }
 
-    def between(val: float, lo: float, hi: float) -> bool:
-        return pd.notna(val) and lo <= val <= hi
-
     price = metrics["close"]
-    if not between(price, float(strategy["price_min"]), float(strategy["price_max"])):
+    if np.isnan(price) or price < float(strategy.get("price_min", 2)):
         return False, metrics
 
-    if circ_mv is not None and pd.notna(circ_mv):
-        if not between(float(circ_mv), float(strategy["circ_mv_min_yi"]), float(strategy["circ_mv_max_yi"])):
-            return False, metrics
+    if np.isnan(mv) or mv < float(strategy.get("circ_mv_min_yi", 30)):
+        return False, metrics
 
-    if not between(metrics["pct_chg"], float(strategy["pct_chg_min"]), float(strategy["pct_chg_max"])):
+    pe = metrics["pe_ttm"]
+    pb = metrics["pb"]
+    pe_max = float(strategy.get("pe_max", 150))
+    pb_max = float(strategy.get("pb_max", 15))
+    if np.isnan(pe) or not (0 < pe <= pe_max):
         return False, metrics
-    if metrics["pct_chg"] < float(strategy["daily_drop_floor"]):
+    if np.isnan(pb) or not (0 < pb <= pb_max):
         return False, metrics
-    if not between(metrics["turnover"], float(strategy["turnover_min"]), float(strategy["turnover_max"])):
+
+    drawdown = metrics["drawdown_250"]
+    if np.isnan(drawdown) or drawdown < float(strategy.get("drawdown_min", 30)):
         return False, metrics
-    if not between(
-        metrics["volume_ratio"],
-        float(strategy["volume_ratio_min"]),
-        float(strategy["volume_ratio_max"]),
-    ):
+    pos = metrics["range_pos"]
+    if np.isnan(pos) or pos < 0 or pos > float(strategy.get("range_pos_max", 0.35)):
         return False, metrics
-    if bool(row.get("had_limit_up_20", False)):
-        return False, metrics
-    if metrics["consecutive_up"] > float(strategy["consecutive_up_max"]):
-        return False, metrics
-    if not between(metrics["ret_60d"], float(strategy["ret_60d_min"]), float(strategy["ret_60d_max"])):
-        return False, metrics
-    if not between(
-        metrics["drawdown_60d"],
-        float(strategy["drawdown_60d_min"]),
-        float(strategy["drawdown_60d_max"]),
-    ):
-        return False, metrics
-    if not between(metrics["ret_5d"], float(strategy["ret_5d_min"]), float(strategy["ret_5d_max"])):
+
+    amount_min = float(strategy.get("amount_median_min_yi", 0.5)) * 1e8
+    if np.isnan(metrics["amount_median"]) or metrics["amount_median"] < amount_min:
         return False, metrics
 
     return True, metrics

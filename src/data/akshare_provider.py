@@ -215,18 +215,36 @@ class AkshareProvider(DataProvider):
         return df
 
     def list_universe(self) -> pd.DataFrame:
+        from src.strategy.filters import is_main_board_code, pass_name_filters
+
         spot = self._load_spot()
+        strategy = self.config.get("strategy", {}) or {}
+        floor = float(strategy.get("circ_mv_min_yi", 30))
         max_stocks = int(self.data_cfg.get("max_stocks", 0) or 0)
-        out = spot[["code", "name", "circ_mv", "price", "is_st"]].copy()
+        cols = ["code", "name", "circ_mv", "price", "is_st"]
+        empty = pd.DataFrame(columns=cols)
+        out = spot.copy()
+        if out.empty or "code" not in out.columns:
+            return empty
+        if "amount" not in out.columns:
+            out["amount"] = float("nan")
+        out["amount"] = pd.to_numeric(out["amount"], errors="coerce")
+        out["circ_mv"] = pd.to_numeric(out["circ_mv"], errors="coerce")
+        out = out[out["code"].map(lambda code: is_main_board_code(str(code), strategy))]
+        if out.empty:
+            return empty
+        keep = out.apply(
+            lambda row: pass_name_filters(str(row.get("name", "")), bool(row.get("is_st", False)), strategy),
+            axis=1,
+        )
+        out = out[keep.astype(bool)]
+        out = out[out["circ_mv"] >= floor]
+        if out.empty:
+            return empty
+        out = out.sort_values("amount", ascending=False, na_position="last")
         if max_stocks > 0:
-            # 优先中等流通市值，更贴近策略区间
-            out = out.sort_values("circ_mv", ascending=True)
-            mid = out[(out["circ_mv"] >= 40) & (out["circ_mv"] <= 350)]
-            if len(mid) >= max_stocks:
-                out = mid.head(max_stocks)
-            else:
-                out = out.head(max_stocks)
-        return out.reset_index(drop=True)
+            out = out.head(max_stocks)
+        return out[cols].reset_index(drop=True)
 
     def get_daily(self, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         code = _normalize_code(code)
