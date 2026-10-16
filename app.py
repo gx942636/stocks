@@ -1,7 +1,7 @@
-"""中线埋伏回测的本地网页入口。
+"""中线低位企稳 / 短线两种方案的本地网页入口。
 
 启动：streamlit run app.py
-结果只在页面上查看，不导出 Excel。命令行 main.py 不受影响。
+选定一个假设买入日，结果只在页面上查看。
 """
 from __future__ import annotations
 
@@ -21,63 +21,63 @@ import pandas as pd
 import streamlit as st
 
 from main import load_config
-from src.backtest.engine import run_backtest
-from src.backtest.metrics import summarize_trades, trades_to_frame
 from src.data.base import get_provider
 from src.data.concepts import fetch_stock_profile
 from src.data.network_util import apply_vpn_friendly_split, install_akshare_direct_patch, use_sina_quote_source
 from src.pipeline import (
     build_fund_map,
     collect_stock_data,
-    first_signals,
-    generate_signals,
-    screen_period,
+    resolve_asof,
+    screen_asof,
+    screen_short_asof,
 )
-
-MODE_LABELS = {
-    "选股 + 回测": "both",
-    "只选股": "screen",
-    "只回测": "backtest",
-}
-MODE_BY_VALUE = {value: label for label, value in MODE_LABELS.items()}
+from src.strategy.style import active_strategy, fetch_strategy, resolve_style
 
 CANDIDATE_LABELS = [
-    ("date", "日期"),
+    ("date", "买入日"),
     ("code", "代码"),
     ("name", "名称"),
     ("signal_close", "收盘价"),
-    ("drawdown_250", "一年回撤(%)"),
-    ("range_pos_pct", "区间位置(%)"),
-    ("amount_yi", "日均成交额(亿)"),
+    ("drawdown_60", "60日回撤(%)"),
+    ("low_20", "20日低点"),
+    ("low_dist_pct", "距低点(%)"),
+    ("ret_5d", "近5日涨幅(%)"),
+    ("amount_yi", "成交额中位数(亿)"),
     ("pe_ttm", "PE"),
     ("pb", "PB"),
-    ("circ_mv", "流通市值(亿)"),
     ("industry", "行业"),
 ]
-TRADE_LABELS = [
+
+TREND_LABELS = [
+    ("date", "买入日"),
     ("code", "代码"),
     ("name", "名称"),
-    ("entry_date", "买入日"),
-    ("exit_date", "卖出日"),
-    ("entry_price", "买入价"),
-    ("exit_price", "卖出价"),
-    ("shares", "股数"),
-    ("ret_pct", "收益率(%)"),
-    ("pnl", "盈亏"),
-    ("reason", "退出原因"),
-    ("realized_rr", "实现盈亏比"),
+    ("signal_close", "收盘价"),
+    ("ret_20d", "20日涨幅(%)"),
+    ("drawdown_10", "距10日高点(%)"),
+    ("pct_chg", "当日涨幅(%)"),
+    ("amount_ratio", "量比"),
+    ("close_pos_pct", "收盘位置(%)"),
+    ("resist_price", "压力价"),
+    ("resist_room", "距压力(%)"),
+    ("industry", "行业"),
 ]
-SUMMARY_LABELS = {
-    "trades": "交易笔数",
-    "win_rate": "胜率 (%)",
-    "avg_win_pct": "平均盈利 (%)",
-    "avg_loss_pct": "平均亏损 (%)",
-    "avg_realized_rr": "实现盈亏比",
-    "total_pnl": "总盈亏",
-    "total_return_pct": "总收益率 (%)",
-    "max_drawdown_pct": "最大回撤 (%)",
-    "final_equity": "期末权益",
-}
+
+PULL_LABELS = [
+    ("date", "买入日"),
+    ("code", "代码"),
+    ("name", "名称"),
+    ("signal_close", "收盘价"),
+    ("drawdown_10", "10日回撤(%)"),
+    ("low_8", "8日低点"),
+    ("low_dist_8", "距8日低点(%)"),
+    ("ret_3d", "近3日涨幅(%)"),
+    ("amount_ratio", "量比"),
+    ("close_pos_pct", "收盘位置(%)"),
+    ("resist_price", "压力价"),
+    ("resist_room", "距压力(%)"),
+    ("industry", "行业"),
+]
 
 
 def _as_date(value: Any) -> date:
@@ -113,46 +113,17 @@ def ensure_network(config: dict[str, Any]) -> None:
 
 def validate_form(form: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    if form["start_date"] >= form["end_date"]:
-        errors.append("开始日期必须早于结束日期。")
-    if form["hold_min_days"] > form["hold_max_days"]:
-        errors.append("最短持有天数不能大于最长持有天数。")
-    if form["initial_cash"] <= 0:
-        errors.append("初始资金必须为正数。")
-    if form["max_positions"] <= 0 or form["max_stocks"] <= 0:
-        errors.append("最大持仓和股票数上限必须为正数。")
-    if form["hold_min_days"] <= 0 or form["hold_max_days"] <= 0:
-        errors.append("持有天数必须为正数。")
-    if form["stop_loss_pct"] <= 0 or form["take_profit_pct"] <= 0:
-        errors.append("止损和止盈上限必须为正数。")
-    if form["drawdown_min"] < 0:
-        errors.append("回撤至少不能为负数。")
-    if not 0 <= form["range_pos_pct"] <= 100:
-        errors.append("低位位置上限应在 0 到 100 之间。")
-    if form["amount_min_yi"] < 0:
-        errors.append("日均成交额下限不能为负数。")
+    if form["max_stocks"] <= 0:
+        errors.append("股票数上限必须为正数。")
     return errors
 
 
 def apply_form(base: dict[str, Any], form: dict[str, Any]) -> dict[str, Any]:
     cfg = copy.deepcopy(base)
-    cfg["start_date"] = form["start_date"].strftime("%Y-%m-%d")
-    cfg["end_date"] = form["end_date"].strftime("%Y-%m-%d")
-    cfg["mode"] = MODE_LABELS[form["mode_label"]]
+    cfg["style"] = form["style"]
+    cfg["as_of_date"] = form["as_of_date"].strftime("%Y-%m-%d")
     cfg.setdefault("data", {})
-    cfg.setdefault("strategy", {})
-    cfg.setdefault("backtest", {})
     cfg["data"]["max_stocks"] = int(form["max_stocks"])
-    strategy = cfg["strategy"]
-    strategy["max_positions"] = int(form["max_positions"])
-    strategy["hold_min_days"] = int(form["hold_min_days"])
-    strategy["hold_max_days"] = int(form["hold_max_days"])
-    strategy["stop_loss_pct"] = float(form["stop_loss_pct"]) / 100.0
-    strategy["take_profit_cap_pct"] = float(form["take_profit_pct"]) / 100.0
-    strategy["drawdown_min"] = float(form["drawdown_min"])
-    strategy["range_pos_max"] = float(form["range_pos_pct"]) / 100.0
-    strategy["amount_median_min_yi"] = float(form["amount_min_yi"])
-    cfg["backtest"]["initial_cash"] = float(form["initial_cash"])
     return cfg
 
 
@@ -164,19 +135,24 @@ def _fill_circ_mv(circ_mv_map: dict[str, float], fund_map: dict[str, dict[str, A
             circ_mv_map[code] = float(fund["circ_mv"])
 
 
-def run_backtest_job(config: dict[str, Any], on_progress) -> dict[str, Any]:
-    start_date = str(config["start_date"])
-    end_date = str(config["end_date"])
-    mode = str(config.get("mode", "both")).lower()
-    strategy = config.get("strategy", {})
-    backtest_cfg = config.get("backtest", {})
+def run_screen_job(config: dict[str, Any], on_progress) -> dict[str, Any]:
+    as_of = resolve_asof(config)
+    style = resolve_style(config)
+    strategy = active_strategy(config)
+    fetching = fetch_strategy(config)
     data_cfg = config.get("data", {}) or {}
     cache_key = (
-        start_date,
-        end_date,
+        as_of,
         str(data_cfg.get("source", "akshare")).lower(),
         int(data_cfg.get("max_stocks", 0) or 0),
         "sina" if use_sina_quote_source() else "eastmoney",
+        "raw-v1",
+        int(fetching.get("history_calendar_days", 140)),
+        int(fetching.get("pullback_days", 60)),
+        float(fetching.get("circ_mv_min_yi", 30)),
+        bool(fetching.get("exclude_st", True)),
+        bool(fetching.get("exclude_kcb", True)),
+        bool(fetching.get("exclude_cyb", True)),
     )
 
     provider = get_provider(config, PROJECT_ROOT)
@@ -190,7 +166,7 @@ def run_backtest_job(config: dict[str, Any], on_progress) -> dict[str, Any]:
     else:
         universe = provider.list_universe()
         daily_map, name_map, circ_mv_map = collect_stock_data(
-            provider, universe, start_date, end_date, strategy, progress=on_progress
+            provider, universe, as_of, as_of, fetching, progress=on_progress
         )
         on_progress(0, 0, "读取基本面")
         fund_map = build_fund_map(provider, list(daily_map.keys()))
@@ -205,44 +181,36 @@ def run_backtest_job(config: dict[str, Any], on_progress) -> dict[str, Any]:
                 "fund_map": fund_map,
             }
 
-    signals = generate_signals(
-        daily_map,
-        circ_mv_map,
-        name_map,
-        start_date,
-        end_date,
-        strategy,
-        fund_map,
-        progress=on_progress,
-    )
-    candidates = screen_period(signals)
-    summary: dict[str, Any] = {}
-    trades = pd.DataFrame()
-    equity = pd.DataFrame()
-    ran_backtest = False
-    if mode in ("backtest", "both") and signals is not None and not signals.empty:
-        bt_signals = first_signals(signals)
-        result = run_backtest(bt_signals, daily_map, strategy, backtest_cfg, name_map)
-        summary = summarize_trades(result, float(backtest_cfg.get("initial_cash", 1_000_000)))
-        trades = trades_to_frame(result.trades)
-        equity = result.equity_curve
-        ran_backtest = True
-
-    n_signals = 0 if signals is None or signals.empty else len(signals)
+    if style == "short":
+        candidates = screen_short_asof(
+            daily_map,
+            circ_mv_map,
+            name_map,
+            as_of,
+            strategy,
+            progress=on_progress,
+        )
+    else:
+        candidates = screen_asof(
+            daily_map,
+            circ_mv_map,
+            name_map,
+            as_of,
+            strategy,
+            fund_map,
+            progress=on_progress,
+        )
     fetch_failures = 0 if from_cache else int(getattr(provider, "daily_fetch_failures", 0) or 0)
     return {
-        "mode": mode,
+        "as_of": as_of,
+        "style": style,
         "from_cache": from_cache,
         "n_daily": len(daily_map),
-        "n_signals": n_signals,
+        "n_candidates": 0 if candidates is None or candidates.empty else len(candidates),
         "daily_fetch_failures": fetch_failures,
         "candidates": candidates,
         "klines": _candidate_klines(daily_map, candidates),
         "cache_dir": str(PROJECT_ROOT / str(data_cfg.get("cache_dir", "data_cache"))),
-        "summary": summary,
-        "trades": trades,
-        "equity": equity,
-        "ran_backtest": ran_backtest,
     }
 
 
@@ -409,17 +377,22 @@ def _metric_card(label: str, value: str, tone: str) -> str:
     )
 
 
-def _render_header(start_date: date, end_date: date, mode_label: str) -> None:
+def _render_header(as_of: date, style: str) -> None:
+    if style == "short":
+        kicker = "SHORT-TERM"
+        title = "短线 <span>两种方案</span>"
+    else:
+        kicker = "A-SHARE RESEARCH"
+        title = "中线低位 <span>企稳</span>"
     st.markdown(
         f"""
         <div class="term-head">
           <div>
-            <div class="term-kicker">A-SHARE RESEARCH</div>
-            <div class="term-title">中线低位 <span>筛选</span></div>
+            <div class="term-kicker">{kicker}</div>
+            <div class="term-title">{title}</div>
           </div>
           <div class="term-pills">
-            <span class="pill">{start_date:%Y-%m-%d} → {end_date:%Y-%m-%d}</span>
-            <span class="pill">{mode_label}</span>
+            <span class="pill">假设买入日 {as_of:%Y-%m-%d}</span>
           </div>
         </div>
         """,
@@ -432,7 +405,7 @@ def _render_empty() -> None:
         """
         <div class="empty-board">
           <div class="empty-title">等待指令</div>
-          <p>在左侧设定区间和低位条件，然后开始筛选。结果只在本页查看，市值下限和估值上限仍使用 config.yaml。</p>
+          <p>在左侧选定策略和假设买入日，然后开始筛选。阈值在 config.yaml，结果只在本页查看。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -475,22 +448,51 @@ def _fmt_num(value: Any, digits: int = 1, suffix: str = "") -> str:
     return f"{number:.{digits}f}{suffix}"
 
 
+def _num_or_zero(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:
+        return 0.0
+    return number
+
+
+def _resist_room_text(row: pd.Series) -> str:
+    state = _num_or_zero(row.get("resist_state"))
+    if state == 1:
+        return "已突破"
+    return _fmt_num(row.get("resist_room"), 1, "%")
+
+
 def _candidate_view(candidates: pd.DataFrame, profiles: dict[str, dict[str, Any]]) -> pd.DataFrame:
     view = candidates.copy()
     view["code"] = view["code"].astype(str).str.zfill(6)
-    view["range_pos_pct"] = pd.to_numeric(view.get("range_pos"), errors="coerce") * 100
     view["amount_yi"] = pd.to_numeric(view.get("amount_median"), errors="coerce") / 1e8
     view["industry"] = view["code"].map(
         lambda code: (profiles.get(code) or {}).get("industry") or "—"
     )
+    if "close_pos" in view.columns:
+        view["close_pos_pct"] = pd.to_numeric(view["close_pos"], errors="coerce") * 100
     for col, digits in (
         ("signal_close", 2),
-        ("drawdown_250", 1),
-        ("range_pos_pct", 1),
+        ("drawdown_60", 1),
+        ("low_20", 2),
+        ("low_dist_pct", 1),
+        ("ret_5d", 1),
+        ("ret_20d", 1),
+        ("ret_3d", 1),
+        ("drawdown_10", 1),
+        ("low_8", 2),
+        ("low_dist_8", 1),
+        ("pct_chg", 2),
+        ("amount_ratio", 2),
+        ("close_pos_pct", 0),
+        ("resist_price", 2),
+        ("resist_room", 1),
         ("amount_yi", 2),
         ("pe_ttm", 1),
         ("pb", 2),
-        ("circ_mv", 1),
     ):
         if col in view.columns:
             view[col] = pd.to_numeric(view[col], errors="coerce").round(digits)
@@ -607,38 +609,65 @@ def _render_stock_cards(
     candidates: pd.DataFrame,
     profiles: dict[str, dict[str, Any]],
     klines: dict[str, pd.DataFrame],
+    section: str | None = "个股详情",
 ) -> None:
-    _section("个股详情")
-    st.caption("默认收起。黄色竖线是这只股票在筛选区间里最后一次符合的交易日。")
+    if section:
+        _section(section)
+        st.caption("默认收起。黄色竖线是假设买入日。")
     for _, row in candidates.iterrows():
         code = str(row["code"]).zfill(6)
         name = str(row.get("name") or code)
         profile = profiles.get(code) or {}
         title = f"{code}  {name}    {_fmt_num(row.get('signal_close'), 2)} 元"
         with st.expander(title):
-            pos = row.get("range_pos")
-            try:
-                pos_pct = float(pos) * 100
-            except (TypeError, ValueError):
-                pos_pct = float("nan")
             amount = row.get("amount_median")
             try:
                 amount_yi = float(amount) / 1e8
             except (TypeError, ValueError):
                 amount_yi = float("nan")
-            cards = "".join(
-                [
-                    _metric_card("现价", _fmt_num(row.get("signal_close"), 2), "flat"),
-                    _metric_card("一年回撤", _fmt_num(row.get("drawdown_250"), 1, "%"), "down"),
-                    _metric_card("区间位置", _fmt_num(pos_pct, 1, "%"), "flat"),
+            scheme = str(row.get("scheme") or "")
+            if scheme == "趋势涨":
+                cards = [
+                    _metric_card("收盘价", _fmt_num(row.get("signal_close"), 2), "flat"),
+                    _metric_card("20日涨幅", _fmt_num(row.get("ret_20d"), 1, "%"), _tone(_num_or_zero(row.get("ret_20d")))),
+                    _metric_card("距10日高点", _fmt_num(row.get("drawdown_10"), 1, "%"), "flat"),
+                    _metric_card("当日涨幅", _fmt_num(row.get("pct_chg"), 2, "%"), _tone(_num_or_zero(row.get("pct_chg")))),
+                    _metric_card("量比", _fmt_num(row.get("amount_ratio"), 2), "flat"),
+                    _metric_card("收盘位置", _fmt_num(row.get("close_pos_pct"), 0, "%"), "flat"),
+                    _metric_card("压力价", _fmt_num(row.get("resist_price"), 2), "flat"),
+                    _metric_card("距压力", _resist_room_text(row), "flat"),
+                    _metric_card("20日成交额", _fmt_num(amount_yi, 2, "亿"), "flat"),
+                ]
+            elif scheme == "回踩止跌":
+                cards = [
+                    _metric_card("收盘价", _fmt_num(row.get("signal_close"), 2), "flat"),
+                    _metric_card("10日回撤", _fmt_num(row.get("drawdown_10"), 1, "%"), "down"),
+                    _metric_card("8日低点", _fmt_num(row.get("low_8"), 2), "flat"),
+                    _metric_card("距低点", _fmt_num(row.get("low_dist_8"), 1, "%"), "flat"),
+                    _metric_card("近3日涨幅", _fmt_num(row.get("ret_3d"), 1, "%"), _tone(_num_or_zero(row.get("ret_3d")))),
+                    _metric_card("量比", _fmt_num(row.get("amount_ratio"), 2), "flat"),
+                    _metric_card("收盘位置", _fmt_num(row.get("close_pos_pct"), 0, "%"), "flat"),
+                    _metric_card("压力价", _fmt_num(row.get("resist_price"), 2), "flat"),
+                    _metric_card("距压力", _resist_room_text(row), "flat"),
+                    _metric_card("20日成交额", _fmt_num(amount_yi, 2, "亿"), "flat"),
+                    _metric_card("当日涨幅", _fmt_num(row.get("pct_chg"), 2, "%"), _tone(_num_or_zero(row.get("pct_chg")))),
+                ]
+            else:
+                cards = [
+                    _metric_card("收盘价", _fmt_num(row.get("signal_close"), 2), "flat"),
+                    _metric_card("60日回撤", _fmt_num(row.get("drawdown_60"), 1, "%"), "down"),
+                    _metric_card("20日低点", _fmt_num(row.get("low_20"), 2), "flat"),
+                    _metric_card("距低点", _fmt_num(row.get("low_dist_pct"), 1, "%"), "flat"),
+                    _metric_card("近5日涨幅", _fmt_num(row.get("ret_5d"), 1, "%"), "flat"),
+                    _metric_card("60日成交额", _fmt_num(amount_yi, 2, "亿"), "flat"),
                     _metric_card("PE", _fmt_num(row.get("pe_ttm"), 1), "flat"),
                     _metric_card("PB", _fmt_num(row.get("pb"), 2), "flat"),
-                    _metric_card("流通市值", _fmt_num(row.get("circ_mv"), 1, "亿"), "flat"),
-                    _metric_card("120日成交额", _fmt_num(amount_yi, 2, "亿"), "flat"),
-                    _metric_card("符合天数", _fmt_num(row.get("hit_days"), 0, "天"), "flat"),
                 ]
-            )
-            st.markdown(f'<div class="metric-grid">{cards}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+            if scheme:
+                reason = str(row.get("reason") or "").strip()
+                if reason:
+                    st.caption(reason)
             st.markdown(_theme_html(profile), unsafe_allow_html=True)
             daily = klines.get(code)
             if daily is None or daily.empty:
@@ -647,66 +676,88 @@ def _render_stock_cards(
                 _render_kline(daily, row.get("date"))
 
 
+def _scheme_frame(candidates: pd.DataFrame, scheme: str) -> pd.DataFrame:
+    if candidates is None or candidates.empty or "scheme" not in candidates.columns:
+        return pd.DataFrame()
+    out = candidates[candidates["scheme"] == scheme]
+    return out.reset_index(drop=True)
+
+
+def _render_scheme_block(
+    title: str,
+    caption: str,
+    frame: pd.DataFrame,
+    labels: list[tuple[str, str]],
+    profiles: dict[str, dict[str, Any]],
+    klines: dict[str, pd.DataFrame],
+    empty_text: str,
+) -> None:
+    _section(title)
+    st.caption(caption)
+    if frame is None or frame.empty:
+        st.info(empty_text)
+        return
+    view = _candidate_view(frame, profiles)
+    st.dataframe(_labeled_frame(view, labels), hide_index=True, use_container_width=True)
+    st.caption("默认收起。黄色竖线是假设买入日。")
+    _render_stock_cards(view, profiles, klines, section=None)
+
+
 def render_result(result: dict[str, Any]) -> None:
     if int(result.get("n_daily") or 0) == 0 and int(result.get("daily_fetch_failures") or 0) > 0:
         st.error("行情接口失败：新浪和东方财富日线都未取到数据。请检查网络，或稍后重试。")
         return
-    mode = result["mode"]
     if result.get("from_cache"):
-        st.caption("行情使用本次会话缓存，只重新计算了信号和回测。")
-    st.caption(f"有效股票 {result['n_daily']} 只，区间信号 {result['n_signals']} 条。")
-
-    show_candidates = mode in ("screen", "both")
-    show_backtest = mode in ("backtest", "both")
-
-    if show_backtest:
-        _section("回测摘要")
-        if not result.get("ran_backtest"):
-            st.info("区间内没有信号，未进行回测。")
-        else:
-            summary = result.get("summary") or {}
-            ret = float(summary.get("total_return_pct", 0) or 0)
-            win = float(summary.get("win_rate", 0) or 0)
-            dd = float(summary.get("max_drawdown_pct", 0) or 0)
-            sign = "+" if ret > 0 else ""
-            cards = "".join(
-                [
-                    _metric_card("总收益", f"{sign}{ret}%", _tone(ret)),
-                    _metric_card("胜率", f"{win}%", "up" if win >= 50 else "down"),
-                    _metric_card("最大回撤", f"{dd}%", "down" if dd < 0 else "flat"),
-                    _metric_card("期末权益", f"{float(summary.get('final_equity', 0) or 0):,.2f}", "flat"),
-                ]
-            )
-            st.markdown(f'<div class="metric-grid">{cards}</div>', unsafe_allow_html=True)
-            extra = {SUMMARY_LABELS.get(k, k): v for k, v in summary.items()}
-            st.dataframe(pd.DataFrame([extra]), hide_index=True, use_container_width=True)
-            equity = result.get("equity")
-            if equity is not None and not equity.empty and "equity" in equity.columns:
-                _section("资金曲线")
-                _render_equity(equity)
-            trades = result.get("trades")
-            _section("交易明细")
-            if trades is None or trades.empty:
-                st.info("没有成交记录。")
-            else:
-                st.dataframe(_labeled_frame(trades, TRADE_LABELS), hide_index=True, use_container_width=True)
-
-    if show_candidates:
-        _section("区间符合标的")
-        candidates = result.get("candidates")
-        if candidates is None or candidates.empty:
-            st.info("区间内没有符合的股票。可放宽回撤、低位位置或日均成交额，或增大股票数上限。")
-        else:
+        st.caption("行情使用本次会话缓存，只重新计算了买入日名单。")
+    candidates = result.get("candidates")
+    if result.get("style") == "short":
+        trend = _scheme_frame(candidates, "趋势涨")
+        pull = _scheme_frame(candidates, "回踩止跌")
+        st.caption(f"有效股票 {result['n_daily']} 只。趋势涨 {len(trend)} 只，回踩止跌 {len(pull)} 只。")
+        codes: list[str] = []
+        if candidates is not None and not candidates.empty:
             codes = [str(code).zfill(6) for code in candidates["code"].tolist()]
-            profiles = _load_profiles(codes, Path(str(result.get("cache_dir") or PROJECT_ROOT / "data_cache")))
-            view = _candidate_view(candidates, profiles)
-            st.caption("区间位置越低，越贴近这一年的低点。行业来自入选后补拉的题材数据。")
-            st.dataframe(_labeled_frame(view, CANDIDATE_LABELS), hide_index=True, use_container_width=True)
-            _render_stock_cards(view, profiles, result.get("klines") or {})
+        profiles = _load_profiles(
+            list(dict.fromkeys(codes)),
+            Path(str(result.get("cache_dir") or PROJECT_ROOT / "data_cache")),
+        )
+        klines = result.get("klines") or {}
+        _render_scheme_block(
+            "趋势涨",
+            "收盘后筛选，供次日早盘买入。收盘偏弱、振幅过大、当天涨完或还在跌的已排除。贴着更早压力、上方空间不足 3% 的已排除。",
+            trend,
+            TREND_LABELS,
+            profiles,
+            klines,
+            "这一天没有符合趋势涨的股票。阈值在 config.yaml 的 strategy_short。",
+        )
+        _render_scheme_block(
+            "回踩止跌",
+            "收盘后筛选，供次日早盘买入。收盘偏弱、振幅过大、当天涨完或还在跌的已排除。贴着更早压力、上方空间不足 3% 的已排除。",
+            pull,
+            PULL_LABELS,
+            profiles,
+            klines,
+            "这一天没有符合回踩止跌的股票。阈值在 config.yaml 的 strategy_short。",
+        )
+        return
+
+    st.caption(f"有效股票 {result['n_daily']} 只，符合中线低位企稳 {result['n_candidates']} 只。")
+
+    _section("假设买入日符合标的")
+    if candidates is None or candidates.empty:
+        st.info("这一天没有符合的股票。策略阈值在 config.yaml。")
+    else:
+        codes = [str(code).zfill(6) for code in candidates["code"].tolist()]
+        profiles = _load_profiles(codes, Path(str(result.get("cache_dir") or PROJECT_ROOT / "data_cache")))
+        view = _candidate_view(candidates, profiles)
+        st.caption("距低点越接近 0，越贴着近 20 日低点。最近 5 天再创新低的不会出现。")
+        st.dataframe(_labeled_frame(view, CANDIDATE_LABELS), hide_index=True, use_container_width=True)
+        _render_stock_cards(view, profiles, result.get("klines") or {})
 
 
 def main() -> None:
-    st.set_page_config(page_title="中线低位筛选", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="选股筛选", layout="wide", initial_sidebar_state="expanded")
     _inject_css()
 
     config_path = PROJECT_ROOT / "config.yaml"
@@ -716,69 +767,28 @@ def main() -> None:
     base = load_config(config_path)
     ensure_network(base)
 
-    strategy = base.get("strategy", {}) or {}
-    backtest_cfg = base.get("backtest", {}) or {}
     data_cfg = base.get("data", {}) or {}
-    default_mode = MODE_BY_VALUE.get(str(base.get("mode", "both")).lower(), "选股 + 回测")
+    default_asof = base.get("as_of_date") or base.get("end_date") or base.get("start_date")
 
     with st.sidebar:
         st.markdown('<div class="side-label">控制台</div>', unsafe_allow_html=True)
-        st.caption("市值下限、估值上限仍使用 config.yaml。")
+        st.caption("中线阈值在 strategy，短线阈值在 strategy_short。")
 
-    with st.sidebar.form("backtest_form"):
-        _side_label("区间")
-        start_date = st.date_input("开始日期", value=_as_date(base.get("start_date")))
-        end_date = st.date_input("结束日期", value=_as_date(base.get("end_date")))
-        mode_label = st.selectbox(
-            "模式",
-            list(MODE_LABELS.keys()),
-            index=list(MODE_LABELS.keys()).index(default_mode),
+    with st.sidebar.form("screen_form"):
+        _side_label("策略")
+        style = st.radio(
+            "策略",
+            options=["mid", "short"],
+            format_func=lambda item: "中线低位企稳" if item == "mid" else "短线",
+            index=0 if resolve_style(base) == "mid" else 1,
+            horizontal=True,
+            label_visibility="collapsed",
         )
-
-        _side_label("资金与持仓")
-        initial_cash = st.number_input(
-            "初始资金",
-            min_value=1.0,
-            value=float(backtest_cfg.get("initial_cash", 1_000_000)),
-            step=100_000.0,
-        )
-        max_positions = st.number_input(
-            "最大持仓",
-            min_value=1,
-            value=int(strategy.get("max_positions", 5)),
-            step=1,
-        )
-        hold_c1, hold_c2 = st.columns(2)
-        hold_min_days = hold_c1.number_input(
-            "最短持有天数",
-            min_value=1,
-            value=int(strategy.get("hold_min_days", 20)),
-            step=1,
-            help="只用于回测里的持有区间，不决定能不能入选。",
-        )
-        hold_max_days = hold_c2.number_input(
-            "最长持有天数",
-            min_value=1,
-            value=int(strategy.get("hold_max_days", 40)),
-            step=1,
-            help="持有达到该交易日数后，按收盘价到期卖出。",
-        )
-
-        _side_label("风控")
-        risk_c1, risk_c2 = st.columns(2)
-        stop_loss_pct = risk_c1.number_input(
-            "止损 (%)",
-            min_value=0.1,
-            value=round(float(strategy.get("stop_loss_pct", 0.12)) * 100, 2),
-            step=0.5,
-            help="填写 12 表示下跌 12% 止损。",
-        )
-        take_profit_pct = risk_c2.number_input(
-            "止盈上限 (%)",
-            min_value=0.1,
-            value=round(float(strategy.get("take_profit_cap_pct", 0.25)) * 100, 2),
-            step=0.5,
-            help="填写 25 表示目标涨幅不超过 25%。",
+        _side_label("买入日")
+        as_of_date = st.date_input(
+            "假设买入日",
+            value=_as_date(default_asof),
+            help="不是交易日时，用不超过它的最近一个交易日。",
         )
         max_stocks = st.number_input(
             "股票数上限",
@@ -787,33 +797,16 @@ def main() -> None:
             step=50,
             help="全市场扫描很慢，可先用较小数量。",
         )
-
-        _side_label("低位条件")
-        drawdown_min = st.number_input(
-            "回撤至少（%）",
-            min_value=0.0,
-            value=float(strategy.get("drawdown_min", 30)),
-            step=1.0,
-            help="相对近一年最高价，至少跌这么多才算处在低位。",
-        )
-        range_pos_pct = st.number_input(
-            "低位位置上限（%）",
-            min_value=0.0,
-            max_value=100.0,
-            value=round(float(strategy.get("range_pos_max", 0.35)) * 100, 1),
-            step=1.0,
-            help="35 表示收盘要落在近一年高低区间里、从低点算起的 35% 以内。",
-        )
-        amount_min_yi = st.number_input(
-            "日均成交额下限（亿）",
-            min_value=0.0,
-            value=float(strategy.get("amount_median_min_yi", 0.5)),
-            step=0.1,
-            help="近 120 个交易日成交额中位数，用来表示以前有没有人交易。",
-        )
         submitted = st.form_submit_button("开始筛选", type="primary", use_container_width=True)
 
-    _render_header(start_date, end_date, mode_label)
+    existing = st.session_state.get("result")
+    if submitted:
+        header_style = style
+    elif isinstance(existing, dict) and existing.get("style"):
+        header_style = str(existing.get("style"))
+    else:
+        header_style = style
+    _render_header(as_of_date, header_style)
     note = st.session_state.get("network_note") or ""
     if note:
         if st.session_state.get("network_warn"):
@@ -823,19 +816,9 @@ def main() -> None:
 
     if submitted:
         form = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "mode_label": mode_label,
-            "initial_cash": initial_cash,
-            "max_positions": max_positions,
-            "hold_min_days": hold_min_days,
-            "hold_max_days": hold_max_days,
-            "stop_loss_pct": stop_loss_pct,
-            "take_profit_pct": take_profit_pct,
+            "style": style,
+            "as_of_date": as_of_date,
             "max_stocks": max_stocks,
-            "drawdown_min": drawdown_min,
-            "range_pos_pct": range_pos_pct,
-            "amount_min_yi": amount_min_yi,
         }
         errors = validate_form(form)
         if errors:
@@ -857,7 +840,7 @@ def main() -> None:
                 bar.progress(min(done / total, 1.0))
 
             try:
-                st.session_state["result"] = run_backtest_job(apply_form(base, form), on_progress)
+                st.session_state["result"] = run_screen_job(apply_form(base, form), on_progress)
                 bar.progress(1.0)
                 done = st.session_state["result"]
                 if int(done.get("n_daily") or 0) == 0 and int(done.get("daily_fetch_failures") or 0) > 0:

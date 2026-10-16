@@ -216,9 +216,10 @@ class AkshareProvider(DataProvider):
 
     def list_universe(self) -> pd.DataFrame:
         from src.strategy.filters import is_main_board_code, pass_name_filters
+        from src.strategy.style import active_strategy
 
         spot = self._load_spot()
-        strategy = self.config.get("strategy", {}) or {}
+        strategy = active_strategy(self.config)
         floor = float(strategy.get("circ_mv_min_yi", 30))
         max_stocks = int(self.data_cfg.get("max_stocks", 0) or 0)
         cols = ["code", "name", "circ_mv", "price", "is_st"]

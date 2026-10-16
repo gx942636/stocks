@@ -1,10 +1,10 @@
 """
-中线埋伏选股 / 回测入口。
+中线低位企稳 / 短线选股入口。
 
 PyCharm 使用：
 1. 打开本项目文件夹
 2. 安装依赖: pip install -r requirements.txt
-3. 修改 config.yaml 中的 start_date / end_date
+3. 修改 config.yaml 中的 as_of_date，style 用 mid 或 short
 4. 右键运行本文件
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data.base import get_provider
 from src.data.network_util import apply_vpn_friendly_split, install_akshare_direct_patch
 from src.pipeline import run_pipeline
+from src.strategy.style import resolve_style
 
 
 def load_config(path: Path) -> dict:
@@ -34,10 +35,11 @@ def main() -> None:
         raise FileNotFoundError(f"找不到配置文件: {config_path}")
 
     config = load_config(config_path)
+    style = resolve_style(config)
+    title = "短线两种方案" if style == "short" else "中线低位企稳"
     print("=" * 60)
-    print("中线埋伏回测程序")
-    print(f"区间: {config.get('start_date')} ~ {config.get('end_date')}")
-    print(f"模式: {config.get('mode')}")
+    print(title)
+    print(f"假设买入日: {config.get('as_of_date')}")
     print(f"数据源: {config.get('data', {}).get('source')}")
     print("=" * 60)
 
@@ -63,28 +65,50 @@ def main() -> None:
 
     candidates = result.get("candidates")
     if candidates is not None and not candidates.empty:
-        cols = [
-            c
-            for c in [
-                "date",
-                "code",
-                "name",
-                "signal_close",
-                "drawdown_250",
-                "range_pos",
-                "amount_median",
-                "pe_ttm",
-                "pb",
-                "circ_mv",
-                "hit_days",
-                "reason",
+        if style == "short":
+            groups = [
+                (
+                    "趋势涨",
+                    ["date", "code", "name", "signal_close", "ret_20d", "drawdown_10", "pct_chg", "amount_ratio", "close_pos", "resist_price", "resist_room", "reason"],
+                ),
+                (
+                    "回踩止跌",
+                    ["date", "code", "name", "signal_close", "drawdown_10", "low_8", "low_dist_8", "ret_3d", "amount_ratio", "close_pos", "resist_price", "resist_room", "reason"],
+                ),
             ]
-            if c in candidates.columns
-        ]
-        print("\n区间符合标的（前 20）：")
-        print(candidates[cols].head(20).to_string(index=False))
+            for scheme, wanted in groups:
+                part = candidates[candidates["scheme"] == scheme] if "scheme" in candidates.columns else candidates.iloc[0:0]
+                print(f"\n{scheme}（{len(part)} 只，显示前 20）：")
+                if part.empty:
+                    print("无")
+                    continue
+                cols = [col for col in wanted if col in part.columns]
+                print(part[cols].head(20).to_string(index=False))
+        else:
+            cols = [
+                c
+                for c in [
+                    "date",
+                    "code",
+                    "name",
+                    "signal_close",
+                    "drawdown_60",
+                    "low_20",
+                    "low_dist_pct",
+                    "ret_5d",
+                    "amount_median",
+                    "pe_ttm",
+                    "pb",
+                    "reason",
+                ]
+                if c in candidates.columns
+            ]
+            print("\n假设买入日符合标的（前 20）：")
+            print(candidates[cols].head(20).to_string(index=False))
+    elif style == "short":
+        print("\n这一天没有符合短线方案的股票。")
     else:
-        print("\n区间内没有符合的股票。可放宽 config.yaml 中的回撤、低位位置或日均成交额。")
+        print("\n这一天没有符合中线低位企稳的股票。")
 
     print(f"\n完成。Excel: {result.get('output')}")
 

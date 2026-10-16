@@ -1,47 +1,93 @@
-# 中线低位筛选 / 回测配置 —— 在 PyCharm 中改这里后运行 main.py
+# 选定一个假设买入日，只出名单。style: mid 中线 | short 短线
 
-start_date: "2026-09-01"
-end_date: "2026-09-08"
-mode: both   # screen | backtest | both
+as_of_date: "2026-09-08"
+style: mid
 
 data:
   source: akshare          # akshare | tushare | csv
   cache_dir: data_cache
   tushare_token: ""        # source=tushare 时填写
   csv_dir: data_cache/csv  # source=csv 时读取目录
-  max_stocks: 800           # 流通市值达标后按成交额从高到低截取
+  max_stocks: 6000         # 流通市值达标后按成交额从高到低截取
   request_pause: 0.12      # 拉单票日线间隔（秒）
   adjust: qfq              # 前复权
   vpn_split_domestic: true # VPN 下保留代理，仅让东方财富等国内行情域名直连
 
 strategy:
-  # 范围
-  price_min: 2             # 只排除低于 2 元的极低价
-  circ_mv_min_yi: 30       # 流通市值下限（亿），不设上限
+  price_min: 2
+  circ_mv_min_yi: 30
   exclude_st: true
-  exclude_kcb: true        # 科创板 688
-  exclude_cyb: true        # 创业板 300 / 301
+  exclude_kcb: true
+  exclude_cyb: true
 
-  # 基本面没有坏（当前截面，不是历史估值）
-  pe_max: 150
-  pb_max: 15
+  # 基本面没有坏（当前截面）
+  pe_max: 80
+  pb_max: 8
 
-  # 相对低位与以前的成交关注度
-  history_calendar_days: 400
-  lookback_days: 250       # 近一年交易日
-  drawdown_min: 30         # 自高点回撤至少（%）
-  range_pos_max: 0.35      # 收盘在高低区间从低点算起的比例上限
-  amount_window: 120
-  amount_median_min_yi: 0.5  # 近 120 日成交额中位数至少（亿）
+  # 中线回撤与止跌
+  history_calendar_days: 140
+  pullback_days: 60
+  drawdown_min: 15
+  drawdown_max: 30
+  low_days: 20
+  stable_days: 5
+  low_dist_max: 6          # 收盘距 20 日低点最多高出（%）
+  ret_5d_max: 6
+  pct_chg_min: -4
+  pct_chg_max: 3
 
-  # 回测持有（不作为入选条件）
-  stop_loss_pct: 0.12
-  take_profit_cap_pct: 0.25
-  repair_ratio: 0.60
-  hold_min_days: 20
-  hold_max_days: 40
-  max_positions: 5
+  # 以前有人交易
+  amount_window: 60
+  amount_median_min_yi: 0.8
 
-backtest:
-  initial_cash: 1000000
-  equal_weight: true
+# 短线两套独立方案：趋势涨、回踩止跌。命中一种即可，不用 PE/PB。
+strategy_short:
+  price_min: 2
+  circ_mv_min_yi: 30
+  exclude_st: true
+  exclude_kcb: true
+  exclude_cyb: true
+
+  history_calendar_days: 80
+  min_bars: 21
+  ma_fast: 10
+  ma_slow: 20
+  high_days: 10
+  amount_window: 20
+  amount_median_min_yi: 1
+
+  # 次日早盘确定性：收在全天偏上，振幅不能太大
+  close_pos_min: 0.65
+  amplitude_max: 6
+
+  # 更早的压力：去掉最近 10 日，上方空间至少 3%
+  resist_lookback: 60
+  resist_gap_days: 10
+  resist_min_prior_bars: 20
+  resist_room_min: 3
+
+  # 趋势涨：还在涨，但当天没有涨完
+  trend_ret_20_min: 8
+  trend_ret_20_max: 25
+  trend_ret_3d_min: 1
+  trend_ret_3d_max: 6
+  trend_drawdown_max: 3
+  trend_pct_min: 1
+  trend_pct_max: 4
+  trend_amount_ratio_min: 1.2
+  trend_amount_ratio_max: 2.2
+
+  # 回踩止跌：止跌已收出，趋势没坏
+  pull_ret_20_min: 8
+  pull_drawdown_min: 5
+  pull_drawdown_max: 10
+  pull_stable_days: 3
+  pull_base_days: 5
+  pull_low_days: 8
+  pull_low_dist_max: 3
+  pull_ret_3d_min: -3
+  pull_ret_3d_max: 3
+  pull_pct_min: 0
+  pull_pct_max: 2.5
+  pull_amount_ratio_min: 0.5
+  pull_amount_ratio_max: 0.85
